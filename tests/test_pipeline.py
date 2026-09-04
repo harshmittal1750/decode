@@ -83,3 +83,47 @@ def test_run_is_recorded_even_when_everything_fails(conn):
     res = pipeline.run_once(conn, s, fetch=boom)
     assert res.ok == [] and res.failed
     assert store.stats(conn)["runs"] == 1
+
+
+# --- alerting: only non-self-healing conditions should page -------------------
+
+def _res(ok, failed):
+    return pipeline.RunResult(run_id=1, ok=list(ok), failed={f: "x" for f in failed})
+
+
+def _streams(gated, open_):
+    mk = lambda n, g: Stream(n, "u", r_heatmap, replayable=False, needs_session=g)
+    return {**{n: mk(n, True) for n in gated}, **{n: mk(n, False) for n in open_}}
+
+
+S = _streams(gated=["g1", "g2"], open_=["o1", "o2"])
+
+
+def test_no_alarm_for_a_transient_single_stream_failure():
+    """Self-heals on the next run -- recorded, not paged."""
+    assert _res(["g1", "g2", "o1"], ["o2"]).alarm(S) is None
+
+
+def test_no_alarm_when_one_gated_stream_flakes():
+    assert _res(["g1", "o1", "o2"], ["g2"]).alarm(S) is None
+
+
+def test_alarm_when_the_whole_gated_class_dies():
+    """Never self-heals: every later run loses the same streams."""
+    msg = _res(["o1", "o2"], ["g1", "g2"]).alarm(S)
+    assert msg and "decode login" in msg
+
+
+def test_alarm_when_everything_fails():
+    msg = _res([], ["g1", "g2", "o1", "o2"]).alarm(S)
+    assert msg and "every stream failed" in msg
+
+
+def test_no_alarm_on_a_clean_run():
+    assert _res(["g1", "g2", "o1", "o2"], []).alarm(S) is None
+
+
+def test_gated_failure_without_any_open_success_is_not_blamed_on_the_session():
+    """If open streams also failed it is an outage, not an expired login."""
+    msg = _res(["o1"], ["g1", "g2", "o2"]).alarm(S)
+    assert msg and "decode login" in msg   # o1 still succeeded -> session diagnosis holds

@@ -10,6 +10,33 @@ uv run decode pressure     # spot vs futures decomposition
 uv run decode liq 85000 60000
 ```
 
+## Running the backend
+
+```bash
+uv sync                          # ingestion + API deps
+uv sync --group browser          # + Playwright, only needed for `login`
+
+uv run decode login               # one-time-per-expiry: capture a fresh
+                                   # obe session via a real browser login
+uv run decode collect --sweep     # fetch all streams; picks up the
+                                   # captured session automatically
+uv run decode serve --port 8000   # read-only JSON API over the archive
+```
+
+`decode login` opens a real, visible Chromium window. Log in yourself (email/
+password or Google) — the password never touches this code, only the
+resulting session value does. It's saved to `data/session.json` (gitignored)
+and every `decode collect` after that reads it automatically; pass `--obe`
+explicitly only to override it. When a stream fails with an API-level
+rejection, `collect` prints `try: decode login` — that's your cue the session
+went stale.
+
+`decode serve` exposes `/status`, `/heatmap`, `/liq`, `/pressure`,
+`/longshort`, `/funding`, `/basis`, `/errors/recent` as JSON, reusing the same
+store/analysis functions the CLI does — no separate logic to keep in sync.
+The `frontend/` directory is a Next.js dashboard that consumes this API
+(`npm run dev`, pointed at it via `NEXT_PUBLIC_API_URL`).
+
 ## Why this exists
 
 CoinGlass serves **current state only**. Swept liquidation levels decay out of
@@ -28,6 +55,9 @@ src/decode/
   store.py       SQLite; the ONLY module that touches the database
   streams.py     endpoint definitions and their reducers
   pipeline.py    fetch -> raw -> reduce -> processed, errors captured
+  session.py     the persisted obe session (data/session.json)
+  login.py       browser capture of a fresh obe (needs --group browser)
+  api.py         read-only JSON API, `decode serve`
   cli.py         command line
   analysis/
     liq.py       liquidation fuel between spot and a target price
@@ -84,8 +114,16 @@ which is why `basis`, not funding, drives the pressure analysis.
 (crontab -l 2>/dev/null; echo "0 */6 * * * cd $PWD && $(which uv) run decode collect --sweep >> data/decode.log 2>&1") | crontab -
 ```
 
-No credentials needed. The `obe` session cookie is optional — every stream was
-verified to return identical data with it absent, garbage, or real.
+No credentials needed for the five core streams — the `obe` session cookie is
+optional there; every one was verified to return identical data with it
+absent, garbage, or real. It does matter for extended-window heatmap queries
+(interval/limit beyond the defaults), which 40000 without a valid session —
+see "Running the backend" above for `decode login`.
+
+Deploying `serve` to a machine without a display? The interactive `login`
+step can only run somewhere with a real browser window. Run it locally, then
+copy `data/session.json` to the remote host — `collect` there reads it the
+same way.
 
 The heatmap's `data=` token is a 30-second TOTP minted per request by
 `token.py`. Both its constants ship in plaintext to every visitor, so this is
@@ -104,7 +142,7 @@ run and logs a warning past 25s.
 uv run pytest
 ```
 
-34 tests. Several pin bugs that actually occurred during development rather than
+39 tests. Several pin bugs that actually occurred during development rather than
 hypothetical ones — the +0.998 misalignment, counting liquidation levels a move
 never reaches, and window geometry inflating the long/short skew by 1.7×.
 

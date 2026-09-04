@@ -7,7 +7,7 @@ import json
 import logging
 import sys
 
-from . import config, pipeline, session, store
+from . import config, pipeline, session, store, streams
 from .analysis import liq, pressure
 
 
@@ -21,13 +21,22 @@ def cmd_collect(args, conn) -> int:
     obe = args.obe or session.read_obe()
     result = pipeline.run_once(conn, obe=obe)
     print(result.summary)
-    if any("api 4000" in msg for msg in result.failed.values()):
-        print("looks like an API-level rejection -- try: decode login", file=sys.stderr)
     if args.sweep:
         n = store.sweep_raw(conn)
         print(f"swept {n} raw blobs older than {config.RAW_RETENTION_DAYS}d")
-    # exit 0 unless EVERYTHING failed: independent streams, one gap is not an outage
-    return 0 if result.ok else 1
+
+    # Exit non-zero ONLY for failures that will not fix themselves, so cron mail
+    # stays worth reading. Transient single-stream errors are already retried in
+    # the run and retried again next run; they are recorded in `errors` for
+    # `decode errors` rather than paged.
+    alarm = result.alarm()
+    if alarm:
+        print(f"ALARM: {alarm}", file=sys.stderr)
+        return 1
+    if result.failed:
+        print(f"note: {len(result.failed)} stream(s) failed transiently "
+              f"({' '.join(result.failed)}); see: decode errors", file=sys.stderr)
+    return 0
 
 
 def cmd_login(args, conn) -> int:
@@ -89,11 +98,33 @@ def cmd_replay(args, conn) -> int:
 
 
 def cmd_liq(args, conn) -> int:
-    row = store.latest(conn, "heatmap")
-    if not row:
-        print("no heatmap rows yet -- run: decode collect", file=sys.stderr)
-        return 1
-    print(liq.report(row, args.targets or [85000, 60000]))
+    if args.live:
+        import urllib.parse
+
+        from . import client, streams, token
+        obe = args.obe or session.read_obe()
+        if streams.window_needs_session(args.window) and not obe:
+            print(f"window {args.window!r} is session-gated and no session is stored; "
+                  "run: decode login  (or pass --obe)", file=sys.stderr)
+            return 1
+        url = (streams.heatmap_url(args.window)
+               + "&data=" + urllib.parse.quote(token.make_token(), safe=""))
+        try:
+            payload = client.fetch(url, obe=obe).payload
+        except Exception as exc:
+            print(f"fetch failed: {exc}", file=sys.stderr)
+            return 1
+        row = streams.r_heatmap(payload)
+        print(f"[live {args.window}] {len(payload['liq'])} cells, "
+              f"{len(payload['prices'])} bars")
+    else:
+        row = store.latest(conn, "heatmap")
+        if not row:
+            print("no heatmap rows yet -- run: decode collect", file=sys.stderr)
+            return 1
+        print(f"[archived run {row['run_id']}  {_ts(row['fetched_at'])}]")
+    # No targets given -> render the whole book instead of guessing prices.
+    print(liq.report(row, args.targets) if args.targets else liq.chart(row))
     return 0
 
 
@@ -140,6 +171,10 @@ def main(argv=None) -> int:
 
     l = sub.add_parser("liq", help="liquidation fuel to given prices")
     l.add_argument("targets", nargs="*", type=float)
+    l.add_argument("--live", action="store_true", help="fetch now instead of reading the archive")
+    l.add_argument("--window", default="24h", choices=sorted(streams.HEATMAP_WINDOWS),
+                   help="which heatmap window to fetch with --live (default 24h)")
+    l.add_argument("--obe", default="", help="session override for gated windows")
     l.set_defaults(fn=cmd_liq)
 
     sub.add_parser("pressure", help="spot vs futures decomposition").set_defaults(fn=cmd_pressure)

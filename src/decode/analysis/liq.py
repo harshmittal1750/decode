@@ -60,6 +60,45 @@ def fuel_within(spot: float, levels: dict[float, float], pct: float = 0.05) -> f
     return sum(v for p, v in levels.items() if abs(p - spot) / spot <= pct)
 
 
+def chart(row: dict, width: int = 46) -> str:
+    """The whole book, ascending by price, as a text bar chart.
+
+    Rendered low-to-high so it reads like the site's own heatmap axis. Spot is
+    marked in place, which is what makes the two sides legible: everything below
+    the marker is long liquidations, everything above is shorts.
+    """
+    spot, levels = book(row)
+    if not levels:
+        return "empty book"
+    rows = sorted(levels.items())
+    peak = max(levels.values())
+    total = sum(levels.values())
+    sk = skew(spot, levels)
+
+    out = [f"spot ${spot:,.0f}   {len(rows)} levels   "
+           f"${rows[0][0]:,.0f} - ${rows[-1][0]:,.0f}   total ${total/1e9:.2f}B",
+           f"longs below ${sk['below_usd']/1e9:.2f}B   shorts above ${sk['above_usd']/1e9:.2f}B"
+           + (f"   per-level skew {sk['per_level']:.2f}x" if sk["per_level"] else ""),
+           ""]
+
+    cum = 0.0
+    marked = False
+    for price, usd in rows:
+        if not marked and price > spot:
+            out.append(f"{'':>10}  {'':>9}  {'-' * width}  <-- SPOT ${spot:,.0f}")
+            marked = True
+        cum += usd
+        bar = "#" * max(1, round(usd / peak * width))
+        side = "S" if price > spot else "L"
+        out.append(f"${price:>9,.0f} {side} ${usd/1e6:>8,.1f}M  {bar:<{width}} "
+                   f"{cum/total*100:>5.1f}%")
+    if not marked:                      # spot sits above every level in the book
+        out.append(f"{'':>10}  {'':>9}  {'-' * width}  <-- SPOT ${spot:,.0f}")
+    out += ["", "L = longs liquidate on the way down, S = shorts on the way up.",
+            "Last column is cumulative share of the book from the bottom up."]
+    return "\n".join(out)
+
+
 def report(row: dict, targets: Iterable[float]) -> str:
     spot, levels = book(row)
     lo, hi = min(levels), max(levels)

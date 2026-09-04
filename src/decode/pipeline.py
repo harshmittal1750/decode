@@ -36,6 +36,30 @@ class RunResult:
             line += f"  FAILED: {' '.join(self.failed)}"
         return line
 
+    def alarm(self, streams: dict[str, Stream] | None = None) -> str | None:
+        """The condition worth waking someone for, or None.
+
+        Alert only on failures that will NOT self-heal. A lone stream erroring is
+        retried three times inside the run and retried again on the next run six
+        hours later; paging for that trains you to ignore the channel, and then
+        the failure that matters arrives somewhere you no longer read.
+
+        Two conditions never self-heal:
+          * every stream down            -- network, DNS, or a rotated cipher
+          * every session-gated stream down while open ones succeed
+                                         -- the login expired, and each later
+                                            run loses the same streams until
+                                            someone runs `decode login`
+        """
+        streams = streams or STREAMS
+        if not self.ok:
+            return "every stream failed -- check connectivity, or the response cipher rotated"
+        gated = {n for n, s in streams.items() if s.needs_session}
+        if gated and gated <= set(self.failed) and any(n not in gated for n in self.ok):
+            return (f"all {len(gated)} session-gated streams failed while open ones "
+                    f"succeeded -- the login has expired; run: decode login")
+        return None
+
 
 def _url_for(s: Stream) -> str:
     if not s.needs_token:

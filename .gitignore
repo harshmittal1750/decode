@@ -3,11 +3,3 @@ __pycache__/
 *.pyc
 .pytest_cache/
 
-# the archive: irreplaceable, but not source. Back it up separately.
-data/decode.db
-data/decode.db-wal
-data/decode.db-shm
-data/decode.log
-data/raw/
-data/collector.jsonl
-data/session.json

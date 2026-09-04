@@ -19,6 +19,40 @@ from .config import API
 # without re-fetching, at roughly 2KB per row.
 SERIES_TAIL = 90
 
+# Named heatmap windows, lifted verbatim from the site's own onChangeTime handler
+# (chunk 12681 / 17190) rather than guessed -- the real limits are irregular
+# (1w is 30m x 336, 2w is 30m x 672, 1mo is h2 x 372) and guessing gets them wrong.
+#
+#   site key -> (interval, limit)
+#   h12 -> 5,144   d1 -> 5,288    h48 -> 15,192   d3  -> 15,288
+#   w1  -> 30,336  w2 -> 30,672   mo1 -> h2,372   mo3 -> h6,360   mo6 -> h12,360
+#
+# `gated` = returns 40000 without a valid login session; measured, not assumed.
+HEATMAP_WINDOWS = {
+    "12h": ("interval=5&limit=144", False),
+    "24h": ("interval=5&limit=288", False),
+    "48h": ("interval=15&limit=192", False),
+    "3d": ("interval=15&limit=288", False),
+    "1w": ("interval=30&limit=336", True),
+    "2w": ("interval=30&limit=672", True),
+    "1m": ("interval=h2&limit=372", True),
+    "3m": ("interval=h6&limit=360", True),
+    "6m": ("interval=h12&limit=360", True),
+}
+DEFAULT_WINDOW = "24h"
+
+
+def heatmap_url(window: str = DEFAULT_WINDOW) -> str:
+    try:
+        q, _ = HEATMAP_WINDOWS[window]
+    except KeyError:
+        raise KeyError(f"unknown window {window!r}; try {sorted(HEATMAP_WINDOWS)}") from None
+    return f"{API}/index/aggregate/liqHeatMap?merge=true&symbol=BTC&{q}"
+
+
+def window_needs_session(window: str) -> bool:
+    return HEATMAP_WINDOWS.get(window, (None, False))[1]
+
 
 @dataclass(frozen=True)
 class Stream:
@@ -27,6 +61,7 @@ class Stream:
     reduce: Callable[[Any], dict]
     replayable: bool
     needs_token: bool = False
+    needs_session: bool = False     # 40000 without a valid login; drives alerting
     note: str = ""
 
 
@@ -109,13 +144,27 @@ STREAMS: dict[str, Stream] = {
                r_funding, replayable=True, note="180d of 8h funding across 14 venues"),
         Stream("basis", f"{API}/basis/v2/chart?symbol=BTC&exName=Binance&interval=h8",
                r_basis, replayable=True, note="perp + 2 quarterlies; ts offset one bar"),
-        Stream("heatmap",
-               f"{API}/index/aggregate/liqHeatMap?merge=true&symbol=BTC&interval=5&limit=288",
-               r_heatmap, replayable=False, needs_token=True,
-               note="NOT REPLAYABLE - the only stream whose history we create"),
+        # heatmap_* streams are appended below, one per named window.
         Stream("longshort", f"{API}/futures/longShortRate?symbol=BTC&timeType=1",
                r_longshort, replayable=True, note="measured positioning, per venue"),
         Stream("liqtoday", f"{API}/futures/liquidation/today?symbol=BTC",
                r_liqtoday, replayable=True, note="realised liquidations, to score the map"),
     ]
 }
+
+# One stream per heatmap window. Each window's live book decays independently, so
+# each is its own irreplaceable series -- a wider window is not a superset of a
+# narrower one at a later date, it is a different resolution of a moment that is
+# already gone. All seven cost 23KB/run combined (~35MB/year at 4 runs/day), so
+# there is no cadence machinery here: collect them all, every run.
+for _w, (_q, _gated) in HEATMAP_WINDOWS.items():
+    STREAMS[f"heatmap_{_w}"] = Stream(
+        f"heatmap_{_w}",
+        f"{API}/index/aggregate/liqHeatMap?merge=true&symbol=BTC&{_q}",
+        r_heatmap, replayable=False, needs_token=True, needs_session=_gated,
+        note=f"NOT REPLAYABLE - {_w} window" + (" (session-gated)" if _gated else ""))
+del _w, _q, _gated
+
+
+def gated_streams() -> set[str]:
+    return {n for n, s in STREAMS.items() if s.needs_session}

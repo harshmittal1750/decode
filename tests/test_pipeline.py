@@ -127,3 +127,40 @@ def test_gated_failure_without_any_open_success_is_not_blamed_on_the_session():
     """If open streams also failed it is an outage, not an expired login."""
     msg = _res(["o1"], ["g1", "g2", "o2"]).alarm(S)
     assert msg and "decode login" in msg   # o1 still succeeded -> session diagnosis holds
+
+
+# --- session expiry warning ---------------------------------------------------
+
+def test_expiry_warning_fires_only_near_the_end(tmp_path, monkeypatch):
+    import json, time
+    from decode import config, session
+    p = tmp_path / "session.json"
+    monkeypatch.setattr(config, "SESSION_PATH", p)
+
+    def write(days_ago):
+        p.write_text(json.dumps({"obe": "s_x",
+                                 "captured_at": (time.time() - days_ago * 86400) * 1000}))
+
+    write(5)
+    assert session.expiry_warning() is None          # fresh: silent
+    write(170)
+    msg = session.expiry_warning()
+    assert msg and "expires in" in msg               # inside the window: warn early
+    write(200)
+    assert "past its 180-day life" in session.expiry_warning()
+
+
+def test_no_session_means_no_warning(tmp_path, monkeypatch):
+    from decode import config, session
+    monkeypatch.setattr(config, "SESSION_PATH", tmp_path / "missing.json")
+    assert session.age_days() is None
+    assert session.expiry_warning() is None
+
+
+def test_open_only_selection_excludes_every_gated_stream():
+    """The unattended-forever mode must not silently include a gated stream."""
+    from decode import streams as S
+    picked = {n: st for n, st in S.STREAMS.items() if not st.needs_session}
+    assert picked and not (set(picked) & S.gated_streams())
+    # and it must still carry the streams the analyses depend on
+    assert {"funding", "basis", "liqhist", "heatmap_24h"} <= set(picked)

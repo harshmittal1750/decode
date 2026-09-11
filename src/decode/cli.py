@@ -7,7 +7,7 @@ import json
 import logging
 import sys
 
-from . import config, pipeline, session, store, streams
+from . import config, fmt, pipeline, session, store, streams
 from .analysis import liq, pressure
 
 
@@ -22,8 +22,18 @@ def _ts(ms) -> str:
 
 def cmd_collect(args, conn) -> int:
     obe = args.obe or session.read_obe()
-    result = pipeline.run_once(conn, obe=obe)
+    # --open-only drops the session-gated streams so a headless host can run
+    # forever with no credential at all. Costs the 1w/2w/1m/3m/6m heatmaps;
+    # keeps funding, basis, positioning, liquidations and the 4 short windows.
+    picked = ({n: st for n, st in streams.STREAMS.items() if not st.needs_session}
+              if args.open_only else streams.STREAMS)
+    if args.open_only:
+        print(f"open-only: {len(picked)}/{len(streams.STREAMS)} streams "
+              "(no session required)")
+    result = pipeline.run_once(conn, picked, obe=obe)
     print(result.summary)
+    if not args.open_only and (warn := session.expiry_warning()):
+        print(f"NOTE: {warn}", file=sys.stderr)
     if args.sweep:
         n = store.sweep_raw(conn)
         print(f"swept {n} raw blobs older than {config.RAW_RETENTION_DAYS}d")
@@ -69,20 +79,48 @@ def cmd_login(args, conn) -> int:
 
 def cmd_serve(args, conn) -> int:
     import uvicorn
-    uvicorn.run("decode.api:app", host="0.0.0.0", port=args.port, reload=args.reload)
+    # Print the URL before handing control to uvicorn: the frontend reads
+    # NEXT_PUBLIC_API_URL from frontend/.env.local, and a port mismatch shows up
+    # in the browser only as an unexplained "Failed to fetch".
+    print(f"serving on http://localhost:{args.port}")
+    print(f"frontend must point here: frontend/.env.local -> "
+          f"NEXT_PUBLIC_API_URL=http://localhost:{args.port}")
+    uvicorn.run("decode.api:app", host="127.0.0.1", port=args.port, reload=args.reload)
     return 0
 
 
 def cmd_status(args, conn) -> int:
     s = store.stats(conn)
-    print(f"db        {config.DB_PATH}")
-    print(f"runs      {s['runs']}   {_ts(s['first_run'])} -> {_ts(s['last_run'])}")
-    print(f"processed {s['processed_rows']} rows   raw {s['raw_rows']}   errors {s['errors']}")
-    print(f"streams   {', '.join(s['streams']) or '-'}")
+    print(fmt.heading("ARCHIVE STATUS"))
+    print()
+    print(fmt.kv([
+        ("Database", str(config.DB_PATH)),
+        ("Runs", f"{s['runs']}   {_ts(s['first_run'])}  to  {_ts(s['last_run'])}"),
+        ("Rows", f"{s['processed_rows']} processed,  {s['raw_rows']} raw,  "
+                 f"{s['errors']} errors"),
+    ], indent=2))
+    print()
+    rows = []
     for name in s["streams"]:
         row = store.latest(conn, name)
-        n = len(store.series(conn, name))
-        print(f"  {name:10} {n:4} rows   latest {_ts(row['fetched_at'])}")
+        gated = "session" if name in streams.gated_streams() else ""
+        rows.append([name, f"{len(store.series(conn, name)):,}",
+                     _ts(row["fetched_at"]), gated])
+    print(fmt.table([("Stream", "<"), ("Rows", ">"), ("Latest", "<"), ("Needs", "<")],
+                    rows, indent=2))
+    if any(r[3] for r in rows):
+        age = session.age_days()
+        print()
+        print(fmt.kv([
+            ("Session age", f"{age:.0f} days" if age is not None else "no session stored"),
+            ("Expires in", f"~{session.SESSION_TTL_DAYS - age:.0f} days"
+                           if age is not None else "-"),
+            ("Renewal", "interactive: `decode login` needs a display and a person"),
+        ], indent=2))
+        print()
+        print("  Streams marked 'session' stop working when the login expires;")
+        print("  the other 9 keep collecting. On a headless host, run `decode login`")
+        print("  locally and copy data/session.json across.")
     return 0
 
 
@@ -185,6 +223,18 @@ def cmd_levels(args, conn) -> int:
         print("no books available", file=sys.stderr)
         return 1
     spot = list(books.values())[0]["spot"]
+    if args.live:
+        # --live is inspection only. Saying so here beats letting someone wonder
+        # why the dashboard disagrees with the terminal they are looking at.
+        print("[live fetch — NOT written to the archive; "
+              "run `decode collect` to update the dashboard]\n")
+    else:
+        newest = max((b.get("fetched_at", 0) for b in books.values()), default=0)
+        if newest:
+            import time as _t
+            age_h = (_t.time() * 1000 - newest) / 3_600_000
+            stale = "  ** stale — run: decode collect **" if age_h > 8 else ""
+            print(f"[from the archive, {age_h:.1f}h old]{stale}\n")
     print(liq.summary_table(books))
     print()
     print(liq.grid_report(books, spot, step=args.step, span_pct=args.span,
@@ -211,6 +261,9 @@ def main(argv=None) -> int:
     c = sub.add_parser("collect", help="fetch all streams into the archive")
     c.add_argument("--obe", default="", help="optional session cookie (not required)")
     c.add_argument("--sweep", action="store_true", help="also expire old raw blobs")
+    c.add_argument("--open-only", action="store_true",
+                   help="collect only streams that need no login session -- lets a "
+                        "headless host run unattended forever (drops 1w/2w/1m/3m/6m)")
     c.add_argument("--no-levels", action="store_true",
                    help="skip the per-timeframe levels summary printed after collecting")
     c.add_argument("--full-levels", action="store_true",
@@ -241,7 +294,8 @@ def main(argv=None) -> int:
 
     l = sub.add_parser("liq", help="liquidation fuel to given prices")
     l.add_argument("targets", nargs="*", type=float)
-    l.add_argument("--live", action="store_true", help="fetch now instead of reading the archive")
+    l.add_argument("--live", action="store_true",
+                    help="fetch now for inspection; does NOT write to the archive")
     l.add_argument("--window", default="24h", choices=sorted(streams.HEATMAP_WINDOWS),
                    help="which heatmap window to fetch with --live (default 24h)")
     l.add_argument("--obe", default="", help="session override for gated windows")
@@ -251,7 +305,9 @@ def main(argv=None) -> int:
     l.set_defaults(fn=cmd_liq)
 
     lv = sub.add_parser("levels", help="price ladder of liquidity across all timeframes")
-    lv.add_argument("--live", action="store_true", help="fetch now instead of the archive")
+    lv.add_argument("--live", action="store_true",
+                    help="fetch now for inspection; does NOT write to the archive "
+                         "(use `decode collect` to update stored data and the dashboard)")
     lv.add_argument("--windows", nargs="*", choices=sorted(streams.HEATMAP_WINDOWS),
                     help=f"default: {' '.join(DEFAULT_LEVEL_WINDOWS)}")
     lv.add_argument("--step", type=float, default=None, help="bucket size in $ (auto)")
@@ -267,7 +323,8 @@ def main(argv=None) -> int:
                     ).set_defaults(fn=cmd_login)
 
     sv = sub.add_parser("serve", help="run the read-only API over the archive")
-    sv.add_argument("--port", type=int, default=8000)
+    sv.add_argument("--port", type=int, default=8787,
+                    help="must match NEXT_PUBLIC_API_URL in frontend/.env.local")
     sv.add_argument("--reload", action="store_true")
     sv.set_defaults(fn=cmd_serve)
 

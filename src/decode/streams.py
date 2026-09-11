@@ -19,6 +19,9 @@ from .config import API
 # without re-fetching, at roughly 2KB per row.
 SERIES_TAIL = 90
 
+# Daily liquidation bars kept per row (the endpoint serves 180).
+LIQ_TAIL = 120
+
 # Named heatmap windows, lifted verbatim from the site's own onChangeTime handler
 # (chunk 12681 / 17190) rather than guessed -- the real limits are irregular
 # (1w is 30m x 336, 2w is 30m x 672, 1mo is h2 x 372) and guessing gets them wrong.
@@ -114,6 +117,22 @@ def r_heatmap(d: Any) -> dict:
             "levels": sorted((y[p], v) for t, p, v in d["liq"] if t == t_now)}
 
 
+def r_liqhist(d: Any) -> dict:
+    """Per-day realised liquidations: what was actually FORCED, not modelled.
+
+    buyVolUsd  = shorts liquidated -> forced BUYING  (lifts price)
+    sellVolUsd = longs  liquidated -> forced SELLING (drops price)
+
+    Only daily bars are available -- the endpoint ignores `interval` entirely
+    (h1/h4/h8/d1 all return the same 180 daily rows), so any attribution built
+    on this is daily-resolution and cannot be finer.
+    """
+    rows = [r for r in d if isinstance(r, dict) and "createTime" in r][-LIQ_TAIL:]
+    return {"ts": rows[-1]["createTime"] if rows else None,
+            "series": [[r["createTime"], r.get("buyVolUsd", 0.0),
+                        r.get("sellVolUsd", 0.0), r.get("price")] for r in rows]}
+
+
 def r_longshort(d: Any) -> dict:
     rows = d[0].get("list", []) if isinstance(d, list) and d else []
     return {"venues": {r["exchangeName"]: {
@@ -149,6 +168,9 @@ STREAMS: dict[str, Stream] = {
                r_longshort, replayable=True, note="measured positioning, per venue"),
         Stream("liqtoday", f"{API}/futures/liquidation/today?symbol=BTC",
                r_liqtoday, replayable=True, note="realised liquidations, to score the map"),
+        Stream("liqhist", f"{API}/futures/liquidation/chart?symbol=BTC&interval=d1",
+               r_liqhist, replayable=True,
+               note="daily forced buys/sells -- separates squeezes from fresh leverage"),
     ]
 }
 

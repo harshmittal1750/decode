@@ -181,3 +181,78 @@ def test_walls_report_quotes_the_core_not_the_support():
     txt = liq.walls_report({"spot": 900.0, "levels": levels})
     assert "MOST shorts sit at $1,000-$1,010" in txt
     assert "tail out to $1,410" in txt
+
+
+# --- formatting -------------------------------------------------------------
+
+def test_money_scales_consistently():
+    from decode import fmt
+    assert fmt.money(1_240_000_000) == "$1.24B"
+    assert fmt.money(340_000_000) == "$340M"
+    assert fmt.money(45_200) == "$45.2K"
+    assert fmt.money(812) == "$812"
+    assert fmt.money(-2_500_000) == "-$2M"
+    assert fmt.money(None) == "-"
+
+
+def test_table_aligns_and_rules():
+    from decode import fmt
+    t = fmt.table([("Name", "<"), ("Qty", ">")], [["a", "1"], ["bb", "22"]])
+    lines = t.splitlines()
+    assert lines[0].startswith("Name") and lines[0].rstrip().endswith("Qty")
+    assert set(lines[1]) == {"─"}
+    assert len(lines[0]) == len(lines[1]) == len(lines[2])   # columns line up
+
+
+def test_band_collapses_single_price():
+    from decode import fmt
+    assert fmt.band(100.0, 100.0) == "$100"
+    assert fmt.band(100.0, 200.0) == "$100 – $200"
+
+
+# --- attribution: forced vs fresh --------------------------------------------
+
+H8 = 8 * 3600 * 1000
+DAY = 86_400_000
+
+
+def _mk(day_idx, spot, basis):
+    return {"ts": day_idx * DAY + 12 * 3600 * 1000, "spot": spot, "basis_pct": basis}
+
+
+def test_attribute_calls_a_squeeze_when_forced_buying_dominates():
+    rows = [_mk(0, 100, 0.00), _mk(1, 110, 0.05)]          # price up, basis up
+    liq = [[1 * DAY, 900.0, 100.0, 110]]                    # 90% forced BUYING
+    a = pressure.attribute(rows, liq)
+    assert a["counts"]["squeeze"] == 1
+    assert a["buckets"]["squeeze"] == pytest.approx(10.0)
+    assert a["verdict"]["main_driver"] == "squeeze"
+
+
+def test_attribute_calls_it_fresh_leverage_when_liquidations_are_light():
+    rows = [_mk(0, 100, 0.00), _mk(1, 110, 0.05)]
+    liq = [[1 * DAY, 100.0, 900.0, 110]]                    # forced SELLING dominates
+    a = pressure.attribute(rows, liq)
+    assert a["counts"]["fresh_leverage"] == 1 and a["counts"]["squeeze"] == 0
+
+
+def test_basis_moving_against_price_is_spot_led():
+    rows = [_mk(0, 100, 0.05), _mk(1, 110, 0.00)]           # price up, basis DOWN
+    a = pressure.attribute(rows, [[1 * DAY, 900.0, 100.0, 110]])
+    assert a["counts"]["spot_led"] == 1
+    assert a["net_spot_led"] == pytest.approx(10.0)
+
+
+def test_days_without_liquidation_data_are_not_guessed_as_fresh():
+    """Absent data is not evidence of light liquidations."""
+    rows = [_mk(0, 100, 0.00), _mk(1, 110, 0.05)]
+    a = pressure.attribute(rows, [])                        # no liq series at all
+    assert a["days_unattributable"] == 1
+    assert sum(a["counts"].values()) == 0
+
+
+def test_long_cascade_on_the_way_down():
+    rows = [_mk(0, 110, 0.05), _mk(1, 100, 0.00)]           # price down, basis down
+    a = pressure.attribute(rows, [[1 * DAY, 100.0, 900.0, 100]])   # forced SELLING
+    assert a["counts"]["long_cascade"] == 1
+    assert a["buckets"]["long_cascade"] < 0

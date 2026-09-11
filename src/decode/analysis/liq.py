@@ -11,6 +11,8 @@ from __future__ import annotations
 
 from typing import Iterable
 
+from .. import fmt
+
 
 def book(row: dict) -> tuple[float, dict[float, float]]:
     """(spot, {price_level: standing_usd}) from a processed heatmap row."""
@@ -170,7 +172,7 @@ def grid(books: dict[str, dict], step: float | None = None,
 
 def grid_report(books: dict[str, dict], spot: float, step: float | None = None,
                 span_pct: float | None = None, hide_empty: bool = False) -> str:
-    """Cross-timeframe price ladder as a table."""
+    """Cross-timeframe price ladder. Empty buckets are shown, not skipped."""
     lo = hi = None
     if span_pct:
         lo, hi = spot * (1 - span_pct / 100), spot * (1 + span_pct / 100)
@@ -180,28 +182,36 @@ def grid_report(books: dict[str, dict], spot: float, step: float | None = None,
     wins = g["windows"]
     peak = max((r["total"] for r in g["rows"]), default=1) or 1
 
-    head = f"{'price':>17} │ " + " ".join(f"{w:>7}" for w in wins) + f" │ {'total':>8}"
-    out = [f"liquidity by price level, ${g['step']:,.0f} buckets   spot ${spot:,.0f}",
-           "", head, "─" * len(head)]
-    spotted = False
+    rows, spot_at = [], None
     for r in g["rows"]:
         if hide_empty and r["total"] == 0:
             continue
-        if not spotted and r["hi"] > spot:
-            out.append(f"{'':>17} ┼ " + "─" * (8 * len(wins) - 1)
-                       + f" ┼ ── SPOT ${spot:,.0f}")
-            spotted = True
-        band = f"${r['lo']:,.0f}-${r['hi']:,.0f}"
-        cells = " ".join(("      ·" if r["cells"][w] == 0
-                          else f"{r['cells'][w]/1e6:>7,.0f}") for w in wins)
-        mark = " " + "▇" * round(r["total"] / peak * 18) if r["total"] else ""
-        out.append(f"{band:>17} │ {cells} │ {r['total']/1e6:>8,.0f}{mark}")
-    if not spotted:
-        out.append(f"{'':>17} ┼ " + "─" * (8 * len(wins) - 1) + f" ┼ ── SPOT ${spot:,.0f}")
-    out += ["", "values are $M of standing liquidation liquidity in that bucket.",
-            "'·' = nothing there: price crosses that level meeting no forced flow.",
-            "below spot = longs (forced selling), above = shorts (forced buying)."]
-    return "\n".join(out)
+        if spot_at is None and r["hi"] > spot:
+            spot_at = len(rows) - 1
+        cells = [("·" if r["cells"][w] == 0 else f"{r['cells'][w]/1e6:,.0f}") for w in wins]
+        bar = "▇" * round(r["total"] / peak * 16) if r["total"] else ""
+        rows.append([fmt.band(r["lo"], r["hi"] - 1),
+                     fmt.pct((r["lo"] - spot) / spot * 100, 1),
+                     *cells,
+                     f"{r['total']/1e6:,.0f}" if r["total"] else "·", bar])
+
+    cols = ([("Price bucket", ">"), ("From spot", ">")]
+            + [(w.upper(), ">") for w in wins]
+            + [("Total", ">"), ("", "<")])
+    return "\n".join([
+        fmt.heading("LIQUIDITY BY PRICE LEVEL"),
+        "",
+        fmt.kv([("Spot", fmt.price(spot)),
+                ("Bucket size", fmt.price(g["step"])),
+                ("Rows", f"{len(rows)}  ({fmt.price(g['lo'])} to {fmt.price(g['hi'])})")],
+               indent=2),
+        "",
+        fmt.table(cols, rows, indent=2, rule_after=spot_at),
+        "",
+        "  Figures are $ millions of standing liquidation liquidity per bucket.",
+        "  '·' means nothing there: price crosses that level meeting no forced flow.",
+        "  The dotted rule marks spot. Below it = longs, above it = shorts.",
+    ])
 
 
 def ladder(row: dict, side: str, gap_mult: float = 1.5) -> list[dict]:
@@ -226,34 +236,39 @@ def ladder(row: dict, side: str, gap_mult: float = 1.5) -> list[dict]:
 
 
 def summary_table(books: dict[str, dict], gap_mult: float = 1.5) -> str:
-    """One row per timeframe: where each side's mass sits and how far away."""
-    head = (f"{'window':>7} │ {'spot':>9} {'book':>8} │ {'longs':>8} {'shorts':>8} │ "
-            f"{'nearest short core':>22} {'away':>6} │ {'nearest long core':>22} {'away':>6}")
-    out = [head, "─" * len(head)]
+    """One row per timeframe: how big each side is and where its mass sits."""
+    rows = []
     for w, row in books.items():
         spot, levels = book(row)
         sk = skew(spot, levels)
-        up = ladder(row, "short", gap_mult)
-        dn = ladder(row, "long", gap_mult)
 
-        def fmt(lad):
+        def core_of(side):
+            lad = ladder(row, side, gap_mult)
             if not lad:
-                return f"{'-':>22}", f"{'-':>6}"
-            z = max(lad, key=lambda z: z["usd"])       # where the MASS is, not the nearest
-            band = (f"${z['core_lo']:,.0f}" if z["core_n"] == 1
-                    else f"${z['core_lo']:,.0f}-${z['core_hi']:,.0f}")
-            return f"{band:>22}", f"{z['dist_pct']:>+5.1f}%"
+                return "-", "-"
+            z = max(lad, key=lambda z: z["usd"])      # where the MASS is
+            return fmt.band(z["core_lo"], z["core_hi"]), fmt.pct(z["dist_pct"])
 
-        ub, ua = fmt(up)
-        db, da = fmt(dn)
-        out.append(f"{w:>7} │ {'$' + format(spot, ',.0f'):>9} "
-                   f"{'$' + format(sum(levels.values())/1e9, '.1f') + 'B':>8} │ "
-                   f"{'$' + format(sk['below_usd']/1e9, '.2f') + 'B':>8} "
-                   f"{'$' + format(sk['above_usd']/1e9, '.2f') + 'B':>8} │ "
-                   f"{ub} {ua} │ {db} {da}")
-    out += ["", "'core' = narrowest band holding half that side's biggest zone.",
-            "Widest windows carry the most history, so their books are largest."]
-    return "\n".join(out)
+        up_band, up_away = core_of("short")
+        dn_band, dn_away = core_of("long")
+        rows.append([w.upper(), fmt.price(spot), fmt.money(sum(levels.values())),
+                     fmt.money(sk["above_usd"]), up_band, up_away,
+                     fmt.money(sk["below_usd"]), dn_band, dn_away])
+
+    return "\n".join([
+        fmt.heading("LIQUIDATION MAP BY TIMEFRAME"),
+        "",
+        fmt.table(
+            [("Window", "<"), ("Spot", ">"), ("Book", ">"),
+             ("Shorts above", ">"), ("Where most shorts sit", ">"), ("Away", ">"),
+             ("Longs below", ">"), ("Where most longs sit", ">"), ("Away", ">")],
+            rows, indent=2),
+        "",
+        "  Shorts liquidate as price RISES  (forced buying).",
+        "  Longs  liquidate as price FALLS  (forced selling).",
+        "  'Where most X sit' = narrowest band holding half that side's largest zone.",
+        "  Longer windows hold more history, so their books are naturally larger.",
+    ])
 
 
 def walls_report(row: dict, top: int = 6, gap_mult: float = 1.5) -> str:

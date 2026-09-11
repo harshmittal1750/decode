@@ -1,6 +1,6 @@
 # decode
 
-Decrypts CoinGlass's API, archives five BTC derivatives streams, and analyses
+Decrypts CoinGlass's API, archives 14 BTC derivatives streams, and analyses
 spot-vs-futures pressure and liquidation fuel.
 
 ```bash
@@ -31,8 +31,10 @@ explicitly only to override it. When a stream fails with an API-level
 rejection, `collect` prints `try: decode login` — that's your cue the session
 went stale.
 
-`decode serve` exposes `/status`, `/heatmap`, `/liq`, `/pressure`,
-`/longshort`, `/funding`, `/basis`, `/errors/recent` as JSON, reusing the same
+`decode serve` exposes `/status`, `/runs`, `/windows`, `/errors/recent`,
+`/heatmap/{window}`, `/liq/{window}`, `/walls/{window}`, `/zones/{window}`,
+`/levels/summary`, `/levels/grid`, `/pressure`, `/funding`, `/longshort`,
+`/liqtoday`, `/series/{stream}` as JSON, reusing the same
 store/analysis functions the CLI does — no separate logic to keep in sync.
 The `frontend/` directory is a Next.js dashboard that consumes this API
 (`npm run dev`, pointed at it via `NEXT_PUBLIC_API_URL`).
@@ -58,11 +60,60 @@ src/decode/
   session.py     the persisted obe session (data/session.json)
   login.py       browser capture of a fresh obe (needs --group browser)
   api.py         read-only JSON API, `decode serve`
+  fmt.py         shared money/percent/table formatting (CLI and UI agree)
   cli.py         command line
   analysis/
     liq.py       liquidation fuel between spot and a target price
     pressure.py  spot vs futures, from the perp-spot basis
 ```
+
+## What gets collected
+
+Every `decode collect` fetches all 14 streams. `decode status` lists them with
+row counts and which need the login session.
+
+| Stream | What it holds | Replayable? | Session? |
+|---|---|---|---|
+| `funding` | 8h funding across 14 venues + spot index, 30d tail | ✅ | — |
+| `basis` | perp + 2 quarterly futures prices, 30d tail | ✅ | — |
+| `longshort` | measured long/short split per venue | ✅ | — |
+| `liqtoday` | realised liquidations, rolling 24h aggregate | ✅ | — |
+| `liqhist` | **daily** realised liquidations, 120d of forced buys/sells | ✅ | — |
+| `heatmap_12h` … `heatmap_3d` | live liquidation book, 4 short windows | ❌ | — |
+| `heatmap_1w` … `heatmap_6m` | live liquidation book, 5 long windows | ❌ | ✅ |
+
+### `liqhist` — what was actually forced
+
+`liqtoday` is a single rolling 24h number; `liqhist` is the per-day series, and
+it is what makes attribution possible:
+
+```
+buyVolUsd   shorts liquidated  ->  forced BUYING   (lifts price)
+sellVolUsd  longs  liquidated  ->  forced SELLING  (drops price)
+```
+
+Basis alone cannot tell a short squeeze from fresh leveraged buying — both
+expand the perp premium identically. Pairing the basis move with realised
+liquidations separates them, which is what `decode pressure` and the dashboard's
+"What is moving the price?" panel report:
+
+| Day looks like | Called |
+|---|---|
+| price up, basis up, >50% forced buying | short squeeze |
+| price up, basis up, light liquidations | fresh leveraged buying |
+| price down, basis down, >50% forced selling | long liquidation cascade |
+| basis moving against price | spot-led |
+
+**Attribution is daily and cannot be finer.** The endpoint ignores `interval`
+entirely — `h1`, `h4`, `h8`, `d1` and the numeric forms all return the same 180
+daily rows (verified). The 8h basis series is folded into days before joining,
+with return and basis change both measured close-to-close; measuring one
+intra-day and the other day-over-day compares different intervals and collapses
+to zero on single-bar days.
+
+Days with no liquidation data are counted in `days_unattributable` and left out
+rather than defaulted to "fresh" — absent data is not evidence of light
+liquidations.
 
 ## Data states
 
@@ -86,8 +137,9 @@ that broke it, and see what it *would* have produced.
 
 ### Retention follows replayability, not a disk budget
 
-`funding`, `basis`, `longshort` and `liqtoday` return their own history on every
-call, so their raw blobs are only a debugging window and expire after 14 days.
+`funding`, `basis`, `longshort`, `liqtoday` and `liqhist` return their own
+history on every call, so their raw blobs are only a debugging window and expire
+after 14 days.
 
 The **heatmap cannot be replayed**. Its processed rows are kept forever and
 `sweep_raw()` is written so it can only ever touch the `raw` table.
@@ -114,7 +166,7 @@ which is why `basis`, not funding, drives the pressure analysis.
 (crontab -l 2>/dev/null; echo "0 */6 * * * cd $PWD && $(which uv) run decode collect --sweep >> data/decode.log 2>&1") | crontab -
 ```
 
-No credentials needed for the five core streams — the `obe` session cookie is
+No credentials needed for the nine open streams — the `obe` session cookie is
 optional there; every one was verified to return identical data with it
 absent, garbage, or real. It does matter for extended-window heatmap queries
 (interval/limit beyond the defaults), which 40000 without a valid session —
@@ -142,9 +194,15 @@ run and logs a warning past 25s.
 uv run pytest
 ```
 
-39 tests. Several pin bugs that actually occurred during development rather than
-hypothetical ones — the +0.998 misalignment, counting liquidation levels a move
-never reaches, and window geometry inflating the long/short skew by 1.7×.
+71 tests. Several pin bugs that actually occurred during development rather than
+hypothetical ones:
+
+- the +0.998 basis misalignment (a lookahead artifact, not a signal)
+- counting liquidation levels a move never actually reaches
+- window geometry inflating the long/short skew by 1.7×
+- a gap-merge reporting an 8%-wide "zone" that was really a 1.5% wall plus tail
+- attribution measuring the return close-to-close but the basis intra-day
+- days with no liquidation data being silently classified as "fresh"
 
 ## Not done yet
 
